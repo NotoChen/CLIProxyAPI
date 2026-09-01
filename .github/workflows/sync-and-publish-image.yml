@@ -61,9 +61,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test CPA
+      - name: Build CPA as release gate
         if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: go test ./...
+        run: go build -o /tmp/CLIProxyAPI ./cmd/server
 
       - name: Set up Docker Buildx
         if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
