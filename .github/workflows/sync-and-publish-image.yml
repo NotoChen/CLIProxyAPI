@@ -144,11 +144,12 @@ jobs:
         if: ${{ failure() }}
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          if [ -z "${DINGTALK_WEBHOOK}" ]; then
-            echo 'DINGTALK_WEBHOOK is not configured.' >&2
+          if [ -z "${DINGTALK_WEBHOOK}" ] || [ -z "${DINGTALK_SECRET}" ]; then
+            echo 'DINGTALK_WEBHOOK or DINGTALK_SECRET is not configured.' >&2
             exit 0
           fi
           content="$(cat <<EOF
@@ -163,8 +164,16 @@ jobs:
           本机不会接收失败运行产生的资产，当前运行版本保持不变。
           EOF
           )"
+          timestamp="$(date +%s)000"
+          sign="$(
+            printf '%s\n%s' "${timestamp}" "${DINGTALK_SECRET}" |
+              openssl dgst -sha256 -hmac "${DINGTALK_SECRET}" -binary |
+              base64 | tr -d '\r\n' | jq -sRr @uri
+          )"
+          separator='?'
+          case "${DINGTALK_WEBHOOK}" in *\?*) separator='&' ;; esac
           payload="$(jq -n --arg content "${content}" '{msgtype:"text",text:{content:$content}}')"
           curl --fail --silent --show-error --max-time 20 \
             -H 'Content-Type: application/json' \
             --data "${payload}" \
-            "${DINGTALK_WEBHOOK}" >/dev/null || true
+            "${DINGTALK_WEBHOOK}${separator}timestamp=${timestamp}&sign=${sign}" >/dev/null || true
