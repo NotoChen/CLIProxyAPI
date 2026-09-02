@@ -22,7 +22,7 @@ env:
 
 jobs:
   sync-build-publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout personal branch
         uses: actions/checkout@v4
@@ -87,10 +87,6 @@ jobs:
       - name: Test CPA
         if: steps.release.outputs.should_build == 'true'
         run: go test ./...
-
-      - name: Set up QEMU
-        if: steps.release.outputs.should_build == 'true'
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         if: steps.release.outputs.should_build == 'true'
