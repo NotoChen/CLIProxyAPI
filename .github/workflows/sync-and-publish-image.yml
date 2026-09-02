@@ -1,4 +1,4 @@
-name: Sync Upstream and Publish Image
+name: Sync Upstream and Publish Release Asset
 
 on:
   schedule:
@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 concurrency:
   group: personal-cli-proxy-api-sync
@@ -17,7 +16,9 @@ env:
   UPSTREAM_REPOSITORY: router-for-me/CLIProxyAPI
   UPSTREAM_BRANCH: main
   PERSONAL_BRANCH: personal
-  IMAGE_NAME: ghcr.io/notchen/cli-proxy-api
+  IMAGE_TAG_PREFIX: cpa-release
+  IMAGE_ARCHIVE: cpa-arm64.tar
+  COMPRESSED_ARCHIVE: cpa-arm64.tar.zst
 
 jobs:
   sync-build-publish:
@@ -29,78 +30,119 @@ jobs:
           ref: personal
           fetch-depth: 0
 
-      - name: Merge upstream stable branch
+      - name: Merge upstream and resolve official version
         id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git fetch --tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --force --tags upstream "${UPSTREAM_BRANCH}"
           upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
           if git merge-base --is-ancestor "${upstream_sha}" HEAD; then
-            echo 'changed=false' >> "${GITHUB_OUTPUT}"
-            echo "personal already contains upstream ${upstream_sha}."
+            changed=false
           else
             git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
-            echo 'changed=true' >> "${GITHUB_OUTPUT}"
+            changed=true
           fi
 
-      - name: Resolve official version
-        id: version
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+          official_version="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          git rev-parse "${official_version}^{commit}" >/dev/null
+          source_sha="$(git rev-parse HEAD)"
+
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+          echo "official_version=${official_version}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check whether this release needs a build
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.sync.outputs.official_version }}
         run: |
           set -euo pipefail
-          official_version="$(git describe --tags --abbrev=0 "upstream/${UPSTREAM_BRANCH}")"
-          echo "value=${official_version}" >> "${GITHUB_OUTPUT}"
+          should_build=false
+          if [ "${{ steps.sync.outputs.changed }}" = 'true' ] || [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            should_build=true
+          elif release_json="$(gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" --json assets 2>/dev/null)"; then
+            for asset in "${COMPRESSED_ARCHIVE}" "${COMPRESSED_ARCHIVE}.sha256"; do
+              if ! jq -e --arg name "${asset}" '.assets[] | select(.name == $name)' <<<"${release_json}" >/dev/null; then
+                should_build=true
+              fi
+            done
+          else
+            should_build=true
+          fi
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Go
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.release.outputs.should_build == 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Build CPA as release gate
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: go build -o /tmp/CLIProxyAPI ./cmd/server
+      - name: Test CPA
+        if: steps.release.outputs.should_build == 'true'
+        run: go test ./...
+
+      - name: Set up QEMU
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.release.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Build and publish CPA image
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+      - name: Build ARM64 Docker archive
+        if: steps.release.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile
           platforms: linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}
+          tags: ${{ env.IMAGE_TAG_PREFIX }}:${{ steps.sync.outputs.official_version }}
+          outputs: type=docker,dest=/tmp/${{ env.IMAGE_ARCHIVE }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.sync.outputs.official_version }}
+            org.opencontainers.image.revision=${{ steps.sync.outputs.source_sha }}
           build-args: |
-            VERSION=${{ steps.version.outputs.value }}
-            COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp || '' }}
+            VERSION=${{ steps.sync.outputs.official_version }}
+            COMMIT=${{ steps.sync.outputs.source_sha }}
+            BUILD_DATE=${{ github.run_started_at }}
 
-      - name: Publish the successfully tested branch
-        if: steps.sync.outputs.changed == 'true'
+      - name: Compress and checksum archive
+        if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          git push origin "HEAD:${PERSONAL_BRANCH}"
+          zstd -T0 -19 "/tmp/${IMAGE_ARCHIVE}" -o "/tmp/${COMPRESSED_ARCHIVE}"
+          sha256sum "/tmp/${COMPRESSED_ARCHIVE}" > "/tmp/${COMPRESSED_ARCHIVE}.sha256"
+
+      - name: Publish tested personal branch
+        if: steps.release.outputs.should_build == 'true' && steps.sync.outputs.changed == 'true'
+        run: git push origin "HEAD:${PERSONAL_BRANCH}"
+
+      - name: Create or update official-version GitHub Release
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.sync.outputs.official_version }}
+          SOURCE_SHA: ${{ steps.sync.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          notes="ARM64 Docker archive built from the ${VERSION} upstream release and the fork's personal branch at ${SOURCE_SHA}."
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}" --repo "${GITHUB_REPOSITORY}" --title "${VERSION}" --notes "${notes}"
+          else
+            gh release create "${VERSION}" --repo "${GITHUB_REPOSITORY}" --target "${SOURCE_SHA}" --title "${VERSION}" --notes "${notes}"
+          fi
+          gh release upload "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            "/tmp/${COMPRESSED_ARCHIVE}" "/tmp/${COMPRESSED_ARCHIVE}.sha256"
 
       - name: Notify DingTalk on failure
         if: ${{ failure() }}
@@ -113,7 +155,7 @@ jobs:
             echo 'DINGTALK_WEBHOOK is not configured.' >&2
             exit 0
           fi
-          content="CPA sync/build/publish failed. Repository: ${GITHUB_REPOSITORY}; run: ${RUN_URL}"
+          content="CPA upstream sync/build/release failed. Repository: ${GITHUB_REPOSITORY}; run: ${RUN_URL}"
           payload="$(jq -n --arg content "${content}" '{msgtype:"text",text:{content:$content}}')"
           curl --fail --silent --show-error --max-time 20 \
             -H 'Content-Type: application/json' \
