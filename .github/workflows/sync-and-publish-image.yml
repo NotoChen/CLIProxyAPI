@@ -108,7 +108,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.sync.outputs.official_version }}
             COMMIT=${{ steps.sync.outputs.source_sha }}
-            BUILD_DATE=${{ github.run_started_at }}
+            BUILD_DATE=unknown
 
       - name: Compress and checksum archive
         if: steps.release.outputs.should_build == 'true'
@@ -151,15 +151,18 @@ jobs:
             echo 'DINGTALK_WEBHOOK is not configured.' >&2
             exit 0
           fi
-          content="【CPA 自动同步失败】
-仓库：${GITHUB_REPOSITORY}
-运行：${RUN_URL}
-处理建议：
-1. 打开运行链接，查看第一个红色步骤和完整日志。
-2. 如果是 upstream merge 冲突：处理 personal 与官方 main 的冲突后重新运行。
-3. 如果是测试或 Docker 构建失败：按失败日志修复代码/依赖后重新运行。
-4. 如果是 Release 发布失败：检查 Actions 的 contents: write 权限后重新运行。
-本机不会接收失败运行产生的资产，当前运行版本保持不变。"
+          content="$(cat <<EOF
+          【CPA 自动同步失败】
+          仓库：${GITHUB_REPOSITORY}
+          运行：${RUN_URL}
+          处理建议：
+          1. 打开运行链接，查看第一个红色步骤和完整日志。
+          2. 如果是 upstream merge 冲突：处理 personal 与官方 main 的冲突后重新运行。
+          3. 如果是测试或 Docker 构建失败：按失败日志修复代码/依赖后重新运行。
+          4. 如果是 Release 发布失败：检查 Actions 的 contents: write 权限后重新运行。
+          本机不会接收失败运行产生的资产，当前运行版本保持不变。
+          EOF
+          )"
           payload="$(jq -n --arg content "${content}" '{msgtype:"text",text:{content:$content}}')"
           curl --fail --silent --show-error --max-time 20 \
             -H 'Content-Type: application/json' \
