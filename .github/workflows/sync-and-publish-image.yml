@@ -92,6 +92,11 @@ jobs:
         if: steps.release.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
+      - name: Resolve build metadata
+        id: metadata
+        if: steps.release.outputs.should_build == 'true'
+        run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
+
       - name: Build ARM64 Docker archive
         if: steps.release.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
@@ -108,7 +113,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.sync.outputs.official_version }}
             COMMIT=${{ steps.sync.outputs.source_sha }}
-            BUILD_DATE=unknown
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
 
       - name: Compress and checksum archive
         if: steps.release.outputs.should_build == 'true'
