@@ -110,6 +110,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.sync.outputs.official_version }}
             org.opencontainers.image.revision=${{ steps.sync.outputs.source_sha }}
+            org.opencontainers.image.created=${{ steps.metadata.outputs.build_date }}
           build-args: |
             VERSION=${{ steps.sync.outputs.official_version }}
             COMMIT=${{ steps.sync.outputs.source_sha }}
@@ -121,6 +122,46 @@ jobs:
           set -euo pipefail
           zstd -T0 -19 "/tmp/${IMAGE_ARCHIVE}" -o "/tmp/${COMPRESSED_ARCHIVE}"
           sha256sum "/tmp/${COMPRESSED_ARCHIVE}" > "/tmp/${COMPRESSED_ARCHIVE}.sha256"
+
+      - name: Smoke-test the built CPA image
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          VERSION: ${{ steps.sync.outputs.official_version }}
+        run: |
+          set -Eeuo pipefail
+          image="${IMAGE_TAG_PREFIX}:${VERSION}"
+          container="cpa-ci-smoke-${GITHUB_RUN_ID}"
+          port=18317
+          docker rm -f "${container}" >/dev/null 2>&1 || true
+          cleanup() {
+            docker rm -f "${container}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker load --input "/tmp/${IMAGE_ARCHIVE}"
+          docker run --pull=never --detach --name "${container}" \
+            --publish "127.0.0.1:${port}:8317" \
+            --volume "${GITHUB_WORKSPACE}/config.example.yaml:/CLIProxyAPI/config.yaml:ro" \
+            "${image}"
+
+          last_code=""
+          for attempt in $(seq 1 45); do
+            if last_code="$(curl --silent --show-error --max-time 5 \
+              --output /dev/null --write-out '%{http_code}' \
+              "http://127.0.0.1:${port}/healthz")" && [ "${last_code}" = '200' ]; then
+              echo "CPA image smoke test passed on attempt ${attempt}."
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || true)" != 'true' ]; then
+              echo "CPA smoke-test container exited (HTTP ${last_code:-000})." >&2
+              docker logs "${container}" >&2 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "CPA image smoke test timed out (last HTTP ${last_code:-000})." >&2
+          docker logs "${container}" >&2 || true
+          exit 1
 
       - name: Publish tested personal branch
         if: steps.release.outputs.should_build == 'true' && steps.sync.outputs.changed == 'true'
@@ -178,7 +219,26 @@ jobs:
           separator='?'
           case "${DINGTALK_WEBHOOK}" in *\?*) separator='&' ;; esac
           payload="$(jq -n --arg content "${content}" '{msgtype:"text",text:{content:$content}}')"
-          curl --fail --silent --show-error --max-time 20 \
+          response_file="${RUNNER_TEMP}/dingtalk-response-${GITHUB_RUN_ID}.json"
+          if http_code="$(curl --fail --silent --show-error --location --http1.1 \
+            --connect-timeout 10 --max-time 20 \
+            --retry 3 --retry-all-errors --retry-connrefused \
+            --retry-delay 2 --retry-max-time 45 \
             -H 'Content-Type: application/json' \
             --data "${payload}" \
-            "${DINGTALK_WEBHOOK}${separator}timestamp=${timestamp}&sign=${sign}" >/dev/null || true
+            -o "${response_file}" -w '%{http_code}' \
+            "${DINGTALK_WEBHOOK}${separator}timestamp=${timestamp}&sign=${sign}")"; then
+            curl_exit=0
+          else
+            curl_exit=$?
+          fi
+          if [ "${curl_exit}" -ne 0 ]; then
+            echo "DingTalk notification request failed (curl=${curl_exit}, http=${http_code:-000})." >&2
+            exit 0
+          fi
+          if [[ ! "${http_code}" =~ ^2[0-9][0-9]$ ]] || \
+            ! jq -e '.errcode == 0' "${response_file}" >/dev/null 2>&1; then
+            echo "DingTalk notification returned an unexpected response (http=${http_code:-000})." >&2
+            exit 0
+          fi
+          echo 'DingTalk failure notification delivered.'
