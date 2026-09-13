@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: personal-cli-proxy-api-sync
+  group: personal-cli-proxy-api-sync-v2
   cancel-in-progress: false
 
 env:
