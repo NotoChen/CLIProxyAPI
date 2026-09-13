@@ -129,6 +129,8 @@ jobs:
           platforms: linux/arm64
           tags: ${{ env.IMAGE_TAG_PREFIX }}:${{ steps.sync.outputs.official_version }}
           outputs: type=docker,dest=/tmp/${{ env.IMAGE_ARCHIVE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.sync.outputs.official_version }}
@@ -199,12 +201,31 @@ jobs:
         run: |
           set -euo pipefail
           notes="ARM64 Docker archive built from the ${VERSION} upstream release and the fork's personal branch at ${SOURCE_SHA}."
-          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release edit "${VERSION}" --repo "${GITHUB_REPOSITORY}" --title "${VERSION}" --notes "${notes}"
-          else
-            gh release create "${VERSION}" --repo "${GITHUB_REPOSITORY}" --target "${SOURCE_SHA}" --title "${VERSION}" --notes "${notes}"
-          fi
-          gh release upload "${VERSION}" \
+
+          retry() {
+            local attempt=1
+            local delay=5
+            until "$@"; do
+              if [ "${attempt}" -ge 5 ]; then
+                return 1
+              fi
+              echo "GitHub API request failed; retrying in ${delay}s (attempt ${attempt}/5)." >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_release() {
+            if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release edit "${VERSION}" --repo "${GITHUB_REPOSITORY}" --title "${VERSION}" --notes "${notes}"
+            else
+              gh release create "${VERSION}" --repo "${GITHUB_REPOSITORY}" --target "${SOURCE_SHA}" --title "${VERSION}" --notes "${notes}"
+            fi
+          }
+
+          retry ensure_release
+          retry gh release upload "${VERSION}" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber \
             "/tmp/${COMPRESSED_ARCHIVE}" "/tmp/${COMPRESSED_ARCHIVE}.sha256"
