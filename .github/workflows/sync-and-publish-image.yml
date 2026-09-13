@@ -27,7 +27,7 @@ env:
 
 jobs:
   sync-build-publish:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout personal branch
         uses: actions/checkout@v4
@@ -104,6 +104,12 @@ jobs:
             test_args=(-skip '^TestOpenAICompatExecutorToolResultContentByInputModalities$')
           fi
           go test ./... "${test_args[@]}"
+
+      - name: Set up QEMU
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         if: steps.release.outputs.should_build == 'true'
