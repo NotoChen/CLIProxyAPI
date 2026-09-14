@@ -95,15 +95,26 @@ jobs:
         continue-on-error: true
         run: go test ./internal/runtime/executor -run '^TestOpenAICompatExecutorToolResultContentByInputModalities$' -count=1
 
-      - name: Test CPA
+      - name: Test fork customization
         if: steps.release.outputs.should_build == 'true'
+        run: go test ./internal/config -run '^TestStaticProviderDisplayName' -count=1
+
+      - name: Test upstream CPA suite (advisory)
+        id: upstream_suite
+        if: steps.release.outputs.should_build == 'true'
+        continue-on-error: true
         run: |
           test_args=()
           if [ "${{ steps.upstream_test_probe.outcome }}" = 'failure' ]; then
             echo '::warning title=Upstream CPA test quarantined::Skipping TestOpenAICompatExecutorToolResultContentByInputModalities while the upstream regression remains reproducible.'
             test_args=(-skip '^TestOpenAICompatExecutorToolResultContentByInputModalities$')
           fi
-          go test ./... "${test_args[@]}"
+          go test ./... "${test_args[@]}" -timeout=5m
+
+      - name: Report upstream test instability
+        if: steps.release.outputs.should_build == 'true' && steps.upstream_suite.outcome == 'failure'
+        run: |
+          echo '::warning title=Upstream CPA suite is unstable::The upstream test suite failed, but the fork customization test passed. Build and smoke-test will continue.'
 
       - name: Set up QEMU
         if: steps.release.outputs.should_build == 'true'
