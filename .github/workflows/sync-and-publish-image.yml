@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: personal-cli-proxy-api-sync-v2
@@ -19,7 +20,6 @@ concurrency:
 
 env:
   UPSTREAM_REPOSITORY: router-for-me/CLIProxyAPI
-  UPSTREAM_BRANCH: main
   PERSONAL_BRANCH: personal
   IMAGE_TAG_PREFIX: cpa-release
   IMAGE_ARCHIVE: cpa-arm64.tar
@@ -41,24 +41,102 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          failure_report="${RUNNER_TEMP}/sync-failure.txt"
+          : > "${failure_report}"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --force --no-tags origin \
+            "${GITHUB_REF_NAME}:refs/remotes/origin/automation"
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git fetch --force --tags upstream "${UPSTREAM_BRANCH}"
-          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          official_version="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          release_ref="refs/remotes/upstream-release/${official_version}"
+          git fetch --force --no-tags upstream \
+            "refs/tags/${official_version}:${release_ref}"
+
+          automation_sha="$(git rev-parse origin/automation)"
+          upstream_sha="$(git rev-parse "${release_ref}^{commit}")"
+          changed=false
+          echo "official_version=${official_version}" >> "${GITHUB_OUTPUT}"
+          echo "official_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+
           if git merge-base --is-ancestor "${upstream_sha}" HEAD; then
-            changed=false
+            echo "Official release ${official_version} is already present."
           else
-            git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+            merge_exit=0
+            git merge --no-edit --no-commit "${upstream_sha}" || merge_exit=$?
+            if [ "${merge_exit}" -gt 1 ]; then
+              printf 'Git merge failed before conflict resolution (exit %s).\n' \
+                "${merge_exit}" | tee "${failure_report}" >&2
+              exit "${merge_exit}"
+            fi
+
+            git rm -r -f --ignore-unmatch .github/workflows
+            if git ls-tree -d --name-only "${upstream_sha}" .github/workflows | grep -q '^.github/workflows$'; then
+              git checkout "${upstream_sha}" -- .github/workflows
+            fi
+            git checkout "${automation_sha}" -- .github/workflows/sync-and-publish-image.yml
+            git add -A .github/workflows
+
+            auto_resolve_paths=(
+              internal/api/handlers/management/config_lists.go
+              internal/config/config_normalization.go
+              internal/config/config_types.go
+              internal/config/vertex_compat.go
+            )
+            auto_resolved=()
+            while IFS= read -r conflict_path; do
+              [ -n "${conflict_path}" ] || continue
+              allowed=false
+              for candidate in "${auto_resolve_paths[@]}"; do
+                if [ "${conflict_path}" = "${candidate}" ]; then
+                  allowed=true
+                  break
+                fi
+              done
+              if [ "${allowed}" = 'true' ]; then
+                if git ls-files -u -- "${conflict_path}" | awk '$3 == 3 { found=1 } END { exit !found }'; then
+                  git checkout --theirs -- "${conflict_path}"
+                  git add -- "${conflict_path}"
+                else
+                  git rm -f -- "${conflict_path}"
+                fi
+                auto_resolved+=("${conflict_path}")
+              fi
+            done < <(git diff --name-only --diff-filter=U)
+
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            if [ -n "${unresolved}" ]; then
+              {
+                echo "Official release ${official_version} has semantic conflicts requiring review:"
+                printf '%s\n' "${unresolved}"
+              } | tee "${failure_report}" >&2
+              exit 1
+            fi
+
+            if [ "${#auto_resolved[@]}" -gt 0 ]; then
+              printf 'Accepted official versions of test-covered paths:\n%s\n' \
+                "$(printf '%s\n' "${auto_resolved[@]}")"
+            fi
+
+            git commit -m "Merge official release ${official_version} into personal"
             changed=true
           fi
 
-          official_version="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
-          git rev-parse "${official_version}^{commit}" >/dev/null
+          git rm -r -f --ignore-unmatch .github/workflows
+          if git ls-tree -d --name-only "${upstream_sha}" .github/workflows | grep -q '^.github/workflows$'; then
+            git checkout "${upstream_sha}" -- .github/workflows
+          fi
+          git checkout "${automation_sha}" -- .github/workflows/sync-and-publish-image.yml
+          git add -A .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: align workflows with ${official_version}"
+            changed=true
+          fi
+
           source_sha="$(git rev-parse HEAD)"
 
           echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
-          echo "official_version=${official_version}" >> "${GITHUB_OUTPUT}"
           echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
 
       - name: Check whether this release needs a build
@@ -83,6 +161,7 @@ jobs:
           echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Go
+        id: setup_go
         if: steps.release.outputs.should_build == 'true'
         uses: actions/setup-go@v5
         with:
@@ -95,9 +174,13 @@ jobs:
         continue-on-error: true
         run: go test ./internal/runtime/executor -run '^TestOpenAICompatExecutorToolResultContentByInputModalities$' -count=1
 
-      - name: Test fork customization
+      - name: Test fork behavior contract
+        id: fork_contract
         if: steps.release.outputs.should_build == 'true'
-        run: go test ./internal/config -run '^TestStaticProviderDisplayName' -count=1
+        run: |
+          go test ./internal/config -run '^TestStaticProviderDisplayName' -count=1
+          go test ./internal/api/handlers/management \
+            -run '^TestPatchStaticProviderDisplayNameForEveryFamily$' -count=1
 
       - name: Test upstream CPA suite (advisory)
         id: upstream_suite
@@ -132,6 +215,7 @@ jobs:
         run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
 
       - name: Build ARM64 Docker archive
+        id: build_image
         if: steps.release.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
@@ -153,6 +237,7 @@ jobs:
             BUILD_DATE=${{ steps.metadata.outputs.build_date }}
 
       - name: Compress and checksum archive
+        id: compress_image
         if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
@@ -160,6 +245,7 @@ jobs:
           sha256sum "/tmp/${COMPRESSED_ARCHIVE}" > "/tmp/${COMPRESSED_ARCHIVE}.sha256"
 
       - name: Smoke-test the built CPA image
+        id: smoke_test
         if: steps.release.outputs.should_build == 'true'
         env:
           VERSION: ${{ steps.sync.outputs.official_version }}
@@ -200,18 +286,21 @@ jobs:
           exit 1
 
       - name: Publish tested personal branch
+        id: publish_branch
         if: steps.release.outputs.should_build == 'true' && steps.sync.outputs.changed == 'true'
         run: git push origin "HEAD:${PERSONAL_BRANCH}"
 
       - name: Create or update official-version GitHub Release
+        id: publish_release
         if: steps.release.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.sync.outputs.official_version }}
+          OFFICIAL_SHA: ${{ steps.sync.outputs.official_sha }}
           SOURCE_SHA: ${{ steps.sync.outputs.source_sha }}
         run: |
           set -euo pipefail
-          notes="ARM64 Docker archive built from the ${VERSION} upstream release and the fork's personal branch at ${SOURCE_SHA}."
+          notes="ARM64 Docker archive built from the official ${VERSION} release (${OFFICIAL_SHA}) and the fork's tested personal branch (${SOURCE_SHA}). Upstream release: https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${VERSION}"
 
           retry() {
             local attempt=1
@@ -242,26 +331,75 @@ jobs:
             "/tmp/${COMPRESSED_ARCHIVE}" "/tmp/${COMPRESSED_ARCHIVE}.sha256"
 
       - name: Notify DingTalk on failure
+        id: failure_notice
         if: ${{ failure() }}
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OFFICIAL_VERSION: ${{ steps.sync.outputs.official_version }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
+          RELEASE_CHECK_OUTCOME: ${{ steps.release.outcome }}
+          SETUP_OUTCOME: ${{ steps.setup_go.outcome }}
+          CONTRACT_OUTCOME: ${{ steps.fork_contract.outcome }}
+          BUILD_OUTCOME: ${{ steps.build_image.outcome }}
+          COMPRESS_OUTCOME: ${{ steps.compress_image.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke_test.outcome }}
+          BRANCH_OUTCOME: ${{ steps.publish_branch.outcome }}
+          RELEASE_OUTCOME: ${{ steps.publish_release.outcome }}
         run: |
           set +e
           if [ -z "${DINGTALK_WEBHOOK}" ] || [ -z "${DINGTALK_SECRET}" ]; then
             echo 'DINGTALK_WEBHOOK or DINGTALK_SECRET is not configured.' >&2
             exit 0
           fi
+
+          failed_stage='unknown'
+          for item in \
+            "sync:${SYNC_OUTCOME}" \
+            "release-check:${RELEASE_CHECK_OUTCOME}" \
+            "go-setup:${SETUP_OUTCOME}" \
+            "fork-contract:${CONTRACT_OUTCOME}" \
+            "image-build:${BUILD_OUTCOME}" \
+            "compression:${COMPRESS_OUTCOME}" \
+            "smoke-test:${SMOKE_OUTCOME}" \
+            "branch-publish:${BRANCH_OUTCOME}" \
+            "release-publish:${RELEASE_OUTCOME}"; do
+            if [ "${item#*:}" = 'failure' ]; then
+              failed_stage="${item%%:*}"
+              break
+            fi
+          done
+
+          detail='No structured detail was recorded. Open the run link for the first red step.'
+          if [ -s "${RUNNER_TEMP}/sync-failure.txt" ]; then
+            detail="$(head -c 1500 "${RUNNER_TEMP}/sync-failure.txt")"
+          fi
+          signature="${OFFICIAL_VERSION:-unknown}|${failed_stage}|${detail}"
+          fingerprint="$(printf '%s' "${signature}" | sha256sum | cut -c1-16)"
+          marker_name="cpa-sync-failure-${fingerprint}"
+          previous_conclusion="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/sync-and-publish-image.yml/runs?status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "none"' 2>/dev/null)"
+          marker_exists="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name == \"${marker_name}\") | .id" 2>/dev/null | head -1)"
+          if [ "${previous_conclusion}" = 'failure' ] && [ -n "${marker_exists}" ]; then
+            echo "Repeated failure ${marker_name}; DingTalk notification suppressed."
+            exit 0
+          fi
+
           content="$(cat <<EOF
           【CPA 自动同步失败】
           仓库：${GITHUB_REPOSITORY}
+          官方版本：${OFFICIAL_VERSION:-未解析}
+          失败阶段：${failed_stage}
+          详情：${detail}
           运行：${RUN_URL}
           处理建议：
-          1. 打开运行链接，查看第一个红色步骤和完整日志。
-          2. 如果是 upstream merge 冲突：处理 personal 与官方 main 的冲突后重新运行。
-          3. 如果是测试或 Docker 构建失败：按失败日志修复代码/依赖后重新运行。
-          4. 如果是 Release 发布失败：检查 Actions 的 contents: write 权限后重新运行。
+          1. fork-contract 失败表示官方改动没有完整保留备注名行为，需要处理源码兼容。
+          2. sync 阶段仅在未知业务文件冲突时停止；工作流冲突和已被测试覆盖的配置冲突会自动处理。
+          3. build/smoke/release 阶段失败可直接打开运行链接重试；未经完整验证不会发布资产。
           本机不会接收失败运行产生的资产，当前运行版本保持不变。
           EOF
           )"
@@ -297,3 +435,14 @@ jobs:
             exit 0
           fi
           echo 'DingTalk failure notification delivered.'
+          printf '%s\n' "${signature}" > "${RUNNER_TEMP}/sync-failure-marker"
+          echo "marker_name=${marker_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record failure fingerprint
+        if: ${{ failure() && steps.failure_notice.outputs.marker_name != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.failure_notice.outputs.marker_name }}
+          path: ${{ runner.temp }}/sync-failure-marker
+          retention-days: 30
+          if-no-files-found: ignore
