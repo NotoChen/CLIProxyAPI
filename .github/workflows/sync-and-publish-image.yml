@@ -45,8 +45,6 @@ jobs:
           : > "${failure_report}"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git fetch --force --no-tags origin \
-            "${GITHUB_REF_NAME}:refs/remotes/origin/automation"
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
 
           official_version="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
@@ -54,7 +52,7 @@ jobs:
           git fetch --force --no-tags upstream \
             "refs/tags/${official_version}:${release_ref}"
 
-          automation_sha="$(git rev-parse origin/automation)"
+          personal_sha="$(git rev-parse HEAD)"
           upstream_sha="$(git rev-parse "${release_ref}^{commit}")"
           changed=false
           echo "official_version=${official_version}" >> "${GITHUB_OUTPUT}"
@@ -71,11 +69,12 @@ jobs:
               exit "${merge_exit}"
             fi
 
+            # The Actions token cannot update workflow files on another branch. Keep the
+            # personal branch workflow tree unchanged; automation lives on main.
             git rm -r -f --ignore-unmatch .github/workflows
-            if git ls-tree -d --name-only "${upstream_sha}" .github/workflows | grep -q '^.github/workflows$'; then
-              git checkout "${upstream_sha}" -- .github/workflows
+            if git ls-tree -d --name-only "${personal_sha}" .github/workflows | grep -q '^.github/workflows$'; then
+              git checkout "${personal_sha}" -- .github/workflows
             fi
-            git checkout "${automation_sha}" -- .github/workflows/sync-and-publish-image.yml
             git add -A .github/workflows
 
             auto_resolve_paths=(
@@ -123,17 +122,6 @@ jobs:
             changed=true
           fi
 
-          git rm -r -f --ignore-unmatch .github/workflows
-          if git ls-tree -d --name-only "${upstream_sha}" .github/workflows | grep -q '^.github/workflows$'; then
-            git checkout "${upstream_sha}" -- .github/workflows
-          fi
-          git checkout "${automation_sha}" -- .github/workflows/sync-and-publish-image.yml
-          git add -A .github/workflows
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: align workflows with ${official_version}"
-            changed=true
-          fi
-
           source_sha="$(git rev-parse HEAD)"
 
           echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
@@ -147,7 +135,9 @@ jobs:
         run: |
           set -euo pipefail
           should_build=false
-          if [ "${{ steps.sync.outputs.changed }}" = 'true' ] || [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+          if [ "${{ steps.sync.outputs.changed }}" = 'true' ] || \
+            [ "${{ github.event_name }}" = 'workflow_dispatch' ] || \
+            [ "${{ github.event_name }}" = 'push' ]; then
             should_build=true
           elif release_json="$(gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" --json assets 2>/dev/null)"; then
             for asset in "${COMPRESSED_ARCHIVE}" "${COMPRESSED_ARCHIVE}.sha256"; do
