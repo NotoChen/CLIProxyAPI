@@ -35,6 +35,13 @@ jobs:
           ref: personal
           fetch-depth: 0
 
+      - name: Set up automation Go
+        id: setup_automation_go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
       - name: Merge upstream and resolve official version
         id: sync
         env:
@@ -77,30 +84,30 @@ jobs:
             fi
             git add -A .github/workflows
 
-            auto_resolve_paths=(
+            customization_paths=(
               internal/api/handlers/management/config_lists.go
               internal/config/config_normalization.go
               internal/config/config_types.go
               internal/config/vertex_compat.go
             )
-            auto_resolved=()
+            customization_conflicts=()
             while IFS= read -r conflict_path; do
               [ -n "${conflict_path}" ] || continue
-              allowed=false
-              for candidate in "${auto_resolve_paths[@]}"; do
+              customization_path=false
+              for candidate in "${customization_paths[@]}"; do
                 if [ "${conflict_path}" = "${candidate}" ]; then
-                  allowed=true
+                  customization_path=true
                   break
                 fi
               done
-              if [ "${allowed}" = 'true' ]; then
+              if [ "${customization_path}" = 'true' ]; then
                 if git ls-files -u -- "${conflict_path}" | awk '$3 == 3 { found=1 } END { exit !found }'; then
                   git checkout --theirs -- "${conflict_path}"
                   git add -- "${conflict_path}"
                 else
                   git rm -f -- "${conflict_path}"
                 fi
-                auto_resolved+=("${conflict_path}")
+                customization_conflicts+=("${conflict_path}")
               fi
             done < <(git diff --name-only --diff-filter=U)
 
@@ -113,9 +120,14 @@ jobs:
               exit 1
             fi
 
-            if [ "${#auto_resolved[@]}" -gt 0 ]; then
-              printf 'Accepted official versions of test-covered paths:\n%s\n' \
-                "$(printf '%s\n' "${auto_resolved[@]}")"
+            customization_tool="${RUNNER_TEMP}/ensure-provider-display-name.go"
+            git show "${GITHUB_SHA}:.github/scripts/ensure-provider-display-name.go" > "${customization_tool}"
+            go run "${customization_tool}"
+            git add -- "${customization_paths[@]}"
+
+            if [ "${#customization_conflicts[@]}" -gt 0 ]; then
+              printf 'Restored provider display-name behavior over official conflict resolutions:\n%s\n' \
+                "$(printf '%s\n' "${customization_conflicts[@]}")"
             fi
 
             git commit -m "Merge official release ${official_version} into personal"
@@ -329,6 +341,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           OFFICIAL_VERSION: ${{ steps.sync.outputs.official_version }}
+          AUTOMATION_SETUP_OUTCOME: ${{ steps.setup_automation_go.outcome }}
           SYNC_OUTCOME: ${{ steps.sync.outcome }}
           RELEASE_CHECK_OUTCOME: ${{ steps.release.outcome }}
           SETUP_OUTCOME: ${{ steps.setup_go.outcome }}
@@ -347,6 +360,7 @@ jobs:
 
           failed_stage='unknown'
           for item in \
+            "automation-go:${AUTOMATION_SETUP_OUTCOME}" \
             "sync:${SYNC_OUTCOME}" \
             "release-check:${RELEASE_CHECK_OUTCOME}" \
             "go-setup:${SETUP_OUTCOME}" \
