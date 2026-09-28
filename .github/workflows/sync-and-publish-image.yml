@@ -125,6 +125,17 @@ jobs:
             go run "${customization_tool}"
             git add -- "${customization_paths[@]}"
 
+            # The module path includes the upstream major version (for example /v8).
+            # Keep the fork contract test aligned after each upstream major-version bump.
+            contract_test_path="internal/api/handlers/management/config_display_name_test.go"
+            if [ -f "${contract_test_path}" ]; then
+              module_path="$(go list -m)"
+              sed -i -E \
+                "s#github.com/router-for-me/CLIProxyAPI/v[0-9]+/internal/config#${module_path}/internal/config#g" \
+                "${contract_test_path}"
+              git add -- "${contract_test_path}"
+            fi
+
             if [ "${#customization_conflicts[@]}" -gt 0 ]; then
               printf 'Restored provider display-name behavior over official conflict resolutions:\n%s\n' \
                 "$(printf '%s\n' "${customization_conflicts[@]}")"
